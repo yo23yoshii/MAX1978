@@ -1,0 +1,355 @@
+#include <Adafruit_GFX.h>    // Core graphics library
+#include <SPI.h>
+#include <Wire.h>      // this is needed even tho we aren't using it
+#include <Adafruit_ILI9341.h>
+#include <Adafruit_STMPE610.h>
+#include <MsTimer2.h>
+#include <EEPROM.h>
+
+// This is calibration data for the raw touch data to the screen coordinates
+#define TS_MINX 150
+#define TS_MINY 130
+#define TS_MAXX 3800
+#define TS_MAXY 4000
+
+// The STMPE610 uses hardware SPI on the shield, and #8
+#define STMPE_CS 8
+Adafruit_STMPE610 ts = Adafruit_STMPE610(STMPE_CS);
+
+// For the Adafruit shield, these are the default.
+#define TFT_DC 9
+#define TFT_CS 10
+
+// Use hardware SPI (on Uno, #13, #12, #11) and the above for CS/DC
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
+// If using the breakout, change pins as desired
+//Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_MOSI, TFT_CLK, TFT_RST, TFT_MISO);
+
+#define max_enable   6
+#define max_chipSelect  7
+
+#define current_limit 1200.0
+
+int target_dn;
+int initial_target_dn;
+int target_r;
+int current_dn;
+int current_r;
+
+volatile int current_I;  // タイマー割り込みで使用　４行
+volatile int state = 0;
+volatile float v_read;
+volatile int aim_dn;
+
+#define delta_dn 10    //  14mV/deg,    140DN/deg, 0.5deg/s, 70DN/s, 35DN/500ms
+
+#define AREF_V 2.829
+
+TS_Point p;
+
+void setup() {
+
+  analogReference(EXTERNAL);                        // AREF 3.3V + 5k ohm + 0.1u F     AREF - 5k - 3.3V,  AREF - 0.1u F - GND
+
+  EEPROM.get(0,target_dn);
+  initial_target_dn=target_dn;
+  target_r = 10000.0 * target_dn / (16384.0- target_dn);
+  
+  pinMode(max_chipSelect, OUTPUT);
+  pinMode(max_enable, OUTPUT);
+  
+  MsTimer2::set(500, flash); // 500ms period
+  MsTimer2::start();
+  
+  Serial.begin(9600);
+  
+  if (!ts.begin()) {
+    Serial.println("Couldn't start touchscreen controller");
+    while (1);
+  }
+  Serial.println("Touchscreen started");
+  
+  tft.begin();
+  tft.setRotation(0);
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(0, 234);
+  tft.setTextColor(ILI9341_WHITE);  
+  tft.setTextSize(1);
+  tft.println("");
+  tft.println("Active  (DN):");
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_GREEN);  
+  tft.println("Target  (DN)            (ohm)");
+  tft.println("");
+  tft.setTextColor(ILI9341_WHITE);  
+  tft.setTextSize(2);
+  tft.print(target_dn); 
+  
+  tft.setCursor(0+13*12, 266);
+  tft.println(target_r);
+  tft.setTextSize(1);
+  tft.println("");
+  tft.setTextColor(ILI9341_GREEN);  
+  tft.println("Current (DN)            (ohm)");
+  tft.setTextColor(ILI9341_WHITE);  
+  //tft.println("Current(ohm):");
+
+  tft.setTextSize(2);
+  //tft.setCursor(0, 202);
+  //tft.print("Current (mA):");
+
+
+  print_disable();
+  
+  tft.drawRect(0, 50, 120, 50, ILI9341_WHITE);
+  tft.setCursor(10,60);
+  tft.print("-1");
+  tft.drawRect(120, 50, 120, 50, ILI9341_WHITE);
+  tft.setCursor(130,60);
+  tft.print("+1");
+  
+  tft.drawRect(0, 100, 120, 50, ILI9341_WHITE);
+  tft.setCursor(10,110);
+  tft.print("-10");
+  tft.drawRect(120, 100, 120, 50, ILI9341_WHITE);
+  tft.setCursor(130,110);
+  tft.print("+10");
+  
+  tft.drawRect(0, 150, 120, 50, ILI9341_WHITE);
+  tft.setCursor(10,160);
+  tft.print("-100");
+  tft.drawRect(120, 150, 120, 50, ILI9341_WHITE);
+  tft.setCursor(130,160);
+  tft.print("+100");
+
+  tft.fillRect(200, 218, 24, 16, ILI9341_GREEN);
+
+  v_read=analogRead(A0)*AREF_V/1024.0;
+  current_r = 10000.0 * v_read / (1.5 - v_read);
+  current_dn=v_read*16384.0/1.5;
+
+  current_I = (analogRead(A1)*AREF_V/1024.0-1.5)/(8.0*0.068)*1000.0;
+
+
+}
+
+
+
+void loop(void) {
+  // See if there's any  touch data for us
+  int a,b ;
+  a=ts.bufferEmpty();
+  b=ts.touched();
+  
+  p = ts.getPoint();
+  
+  if ((a==0)) {
+    while (ts.bufferSize()!=0)  {
+      p = ts.getPoint();
+    }
+    if ((b==1)) {
+      // Scale from ~0->4000 to tft.width using the calibration #'s
+      p.x = map(p.x, TS_MINX, TS_MAXX, 0, tft.width());
+      p.y = map(p.y, TS_MINY, TS_MAXY, 0, tft.height());
+      
+      if ( (p.x > 0) && (p.x < 120) && (p.y > 0) && (p.y <50) ){
+        print_disable();
+        state = 0;
+        digitalWrite(max_enable, LOW);                                    // MAX1978動作OFF
+      }
+      
+      if ( (p.x > 120) && (p.x < 240) && (p.y > 0) && (p.y <50) ){
+        print_enable();
+        aim_dn=current_dn;
+        if(aim_dn<target_dn)
+          state=1;
+        if(aim_dn>target_dn)
+          state=2;
+        if(initial_target_dn!=target_dn)
+          EEPROM.put(0,target_dn);
+      }
+
+      if ( (p.x > 0) && (p.x < 240) && (p.y > 50) && (p.y <200) ){
+        
+        if ( (p.x > 0) && (p.x < 120) && (p.y > 50) && (p.y <100) )
+          target_dn=target_dn-1;
+        if ( (p.x > 120) && (p.x < 240) && (p.y > 50) && (p.y <100) )
+          target_dn=target_dn+1;
+        if ( (p.x > 0) && (p.x < 120) && (p.y > 100) && (p.y <150) )
+          target_dn=target_dn-10;
+        if ( (p.x > 120) && (p.x < 240) && (p.y > 100) && (p.y <150) )
+          target_dn=target_dn+10;
+        if ( (p.x > 0) && (p.x < 120) && (p.y > 150) && (p.y <200) && (state==0))
+          target_dn=target_dn-100;
+        if ( (p.x > 120) && (p.x < 240) && (p.y > 150) && (p.y <200) && (state==0))
+          target_dn=target_dn+100;
+        if (target_dn < 0 ) 
+          target_dn=0; 
+        if (target_dn > 12500 )
+          target_dn=12500;
+        
+//        tft.fillRect(0+13*12, 250, 5*12, 16, ILI9341_BLACK);        // 目標値（デジタル値）を表示
+//        tft.setCursor(0+13*12, 250);
+        tft.fillRect(0, 266, 5*12, 16, ILI9341_BLACK);        // 目標値（デジタル値）を表示
+        tft.setCursor(0, 266);
+        tft.print(target_dn);
+        
+        target_r=10000.0*target_dn/(16384.0-target_dn);
+        
+        tft.fillRect(0+13*12, 266, 5*12, 16, ILI9341_BLACK);        // 目標値（抵抗値）を表示
+        tft.setCursor(0+13*12, 266);
+        tft.print(target_r);
+        }
+    }
+  }
+  delay(100);
+  
+  current_r = 10000.0 * v_read / (1.5 - v_read);
+  current_dn=v_read*16384.0/1.5;
+  
+  print_current_r(current_r);                               // 現在のサーミスタ抵抗値を表示     元データはタイマー割り込み時に取得
+  print_current_dn(current_dn);                             // 現在のサーミスタ抵抗値に相当するデジタル値を表示
+  print_and_set_aim_dn(aim_dn);                             // 作動値（デジタル値）を表示、DAで出力
+  print_state(state);                                       // 現在の状態を表示
+  print_current_I(current_I);                               // 現在の電流値を表示     元データはタイマー割り込み時に取得
+  
+  if(state!=0)
+    digitalWrite(max_enable, HIGH);                      //// MAX1978動作ON
+}
+
+void flash(){
+  v_read=analogRead(A0)*AREF_V/1024.0;
+  current_I = (analogRead(A1)*AREF_V/1024.0-1.5)/(8.0*0.068)*1000.0;
+  //v_read=0.76;
+
+  if (state==1){
+    aim_dn=aim_dn+delta_dn;
+    if (aim_dn>target_dn){
+       aim_dn = target_dn;
+       state=3;
+    }
+  }
+  
+  if (state==2){
+    aim_dn=aim_dn-delta_dn;
+    if (aim_dn<target_dn){
+       aim_dn = target_dn;
+       state=3;
+    }
+  }
+
+   if ((state==3)){ 
+     aim_dn = target_dn;
+  }
+}
+
+void print_state(int newval){
+  static int oldval;
+  if (newval!=oldval){
+    if (newval==0)  
+      tft.fillRect(200, 218, 24, 16, ILI9341_GREEN);
+    if ((newval==1)||(newval==2))  
+      tft.fillRect(200, 218, 24, 16, ILI9341_YELLOW);
+    if (newval==3)  
+      tft.fillRect(200, 218, 24, 16, ILI9341_RED);
+  
+  tft.fillRect(0, 218, 12, 16, ILI9341_BLACK);
+  tft.setCursor(0, 218);
+  tft.print(newval);
+  tft.print(" state");
+  oldval=newval;
+  }
+}
+
+void print_current_I(int newval){
+  static int oldval;
+  if (newval!=oldval){
+  //tft.fillRect(0+13*12, 202, 12*5, 16, ILI9341_BLACK);
+  //tft.setCursor(0+13*12, 202);
+  //tft.print(newval);
+  tft.fillRect(0,202,240,16, ILI9341_BLACK);
+  if (newval>0)
+    tft.fillRect(120,   202,    120.0*newval/current_limit,        16,         ILI9341_RED);
+  if (newval<0)
+    tft.fillRect(120 + 120.0*newval/current_limit,     202,                    -120.0*newval/current_limit,        16,         ILI9341_BLUE);
+  if ((newval>current_limit)||(newval<-current_limit)){
+        print_disable();
+        state = 0;
+        digitalWrite(max_enable, LOW);      
+  }
+    
+  
+  oldval=newval;
+  }
+}
+void print_and_set_aim_dn(int newval){
+  static int oldval;
+  unsigned int volval;
+  byte upper;
+  byte lower;
+
+  if (newval!=oldval){
+  tft.fillRect(0+13*12, 234, 5*12, 16, ILI9341_BLACK);
+  tft.setCursor(0+13*12, 234);
+  tft.print(newval);
+
+  volval = newval;
+
+      digitalWrite(max_chipSelect,LOW);
+      upper = (unsigned int)volval >> 6;
+      SPI.transfer(upper);
+      lower = volval & 0b0000000000111111;
+      SPI.transfer(lower);
+      digitalWrite(max_chipSelect,HIGH); 
+  
+//set DA  昔のプログラム参照 aim_dn 出力
+//  digitalWrite(max_chipSelect, LOW);
+//  SPI.transfer(16); //Send register location
+//  digitalWrite(max_chipSelect, HIGH);
+  
+  oldval=newval;
+  }
+}
+
+void print_current_r(int newval){
+  static int oldval;
+  if (newval!=oldval){
+  tft.fillRect(0+13*12, 298, 5*12, 16, ILI9341_BLACK);
+  tft.setCursor(0+13*12, 298);
+  tft.print(newval);
+  oldval=newval;
+  }
+}
+
+void print_current_dn(int newval){
+  static int oldval;
+  if (newval!=oldval){
+//  tft.fillRect(0+13*12, 282, 5*12, 16, ILI9341_BLACK);
+//  tft.setCursor(0+13*12, 282);
+  tft.fillRect(0, 298, 5*12, 16, ILI9341_BLACK);
+  tft.setCursor(0, 298);
+  tft.print(newval);
+  oldval=newval;
+  }
+}
+
+void print_disable(void){
+        tft.fillRect(0, 0, 240, 50, ILI9341_BLACK);
+        tft.fillRect(0, 0, 120, 50, ILI9341_GREEN);
+        tft.drawRect(120, 0, 120, 50, ILI9341_WHITE);
+        tft.setCursor(130, 10);
+        tft.print("Enable");
+        tft.setCursor(10, 10);
+        tft.print("Disable");
+}
+
+void print_enable(void){
+        tft.fillRect(0, 0, 240, 50, ILI9341_BLACK);
+        tft.fillRect(120, 0, 120, 50, ILI9341_RED);
+        tft.drawRect(0, 0, 120, 50, ILI9341_WHITE);
+        tft.setCursor(130, 10);
+        tft.print("Enable");
+        tft.setCursor(10, 10);
+        tft.print("Disable");
+}
+
